@@ -156,14 +156,14 @@ echo "Data copy complete at $(date)"
 # ----------------------------------------------------------------------------------
 # Setup Python environment
 # ----------------------------------------------------------------------------------
-module load python/3.10
-VENV=jepa_wms module load uv/0.6.12
+source /cluster/home/${USER}/miniconda3/etc/profile.d/conda.sh
+conda activate jepa-wms
 
 # ----------------------------------------------------------------------------------
 # Run training
 # ----------------------------------------------------------------------------------
 echo "Starting training at $(date)"
-srun --ntasks=1 --exclusive uv run python -m app.main "$@" &
+srun --ntasks=1 --exclusive python -m app.main "$@" &
 
 TRAIN_PID=$!
 wait $TRAIN_PID
