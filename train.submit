@@ -1,0 +1,208 @@
+#!/bin/bash
+#SBATCH --time=1440
+#SBATCH --job-name=jepa_wms
+#SBATCH --ntasks=1
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=200G
+#SBATCH --account=cai_cv
+#SBATCH --partition=gpu_top
+#SBATCH --nodelist=trinity,sanjose
+#SBATCH --output=%j_%N.out
+#SBATCH --error=%j_%N.err
+#SBATCH --signal=B:SIGUSR1@300
+
+# ----------------------------------------------------------------------------------
+# Setup paths and cache directories
+# ----------------------------------------------------------------------------------
+export PYTHONPATH="${PYTHONPATH}:/cluster/home/${USER}/jepa-wms"
+
+export WANDB_CACHE_DIR=/scratch/wandb/.cache
+export WANDB_DATA_DIR=/scratch/wandb/data
+export TORCHINDUCTOR_CACHE_DIR=/scratch/torchinductor_cache_${SLURM_JOB_ID}
+
+SCRATCH_BASE="/scratch"
+HOME_BASE="/cluster/home/${USER}/jepa-wms"
+RUN_INFO_DIR="${HOME_BASE}/.run_info"
+
+mkdir -p $WANDB_CACHE_DIR
+mkdir -p $WANDB_DATA_DIR
+mkdir -p $TORCHINDUCTOR_CACHE_DIR
+mkdir -p ${RUN_INFO_DIR}
+
+RUN_ID_FILE="${RUN_INFO_DIR}/run_id_${SLURM_JOB_ID}.txt"
+chmod -R 755 $TORCHINDUCTOR_CACHE_DIR
+
+echo "HOME_BASE: $HOME_BASE"
+echo "RUN_INFO_DIR: $RUN_INFO_DIR"
+
+source "${HOME_BASE}/.env"
+
+SCRATCH_DATA_ROOT="/scratch/datasets"
+export DATASET_DIR=$SCRATCH_DATA_ROOT
+
+# Check for a stored run ID (resume support)
+if [ -f "${RUN_ID_FILE}" ]; then
+    export FIXED_RUN_ID=$(cat ${RUN_ID_FILE})
+    echo "Continuing previous run with ID: ${FIXED_RUN_ID}"
+else
+    export FIXED_RUN_ID=$(date +%Y-%m-%d_%H-%M-%S)
+    echo ${FIXED_RUN_ID} > ${RUN_ID_FILE}
+    echo "Starting new run with ID: ${FIXED_RUN_ID}"
+fi
+
+SCRATCH_RUN_DIR="$SCRATCH_BASE/outputs/$FIXED_RUN_ID"
+HOME_RUN_DIR="$HOME_BASE/outputs/$FIXED_RUN_ID"
+mkdir -p "$SCRATCH_RUN_DIR"
+mkdir -p "$HOME_RUN_DIR"
+
+echo "SCRATCH_RUN_DIR: $SCRATCH_RUN_DIR"
+echo "HOME_RUN_DIR: $HOME_RUN_DIR"
+
+DATASETS=("point_maze" "pusht_dataset")
+
+# ----------------------------------------------------------------------------------
+# Check if this is a requeued job
+# ----------------------------------------------------------------------------------
+if [ -n "$SLURM_RESTART_COUNT" ] && [ $SLURM_RESTART_COUNT -gt 0 ]; then
+    echo "REQUEUED JOB - Restart count: $SLURM_RESTART_COUNT ($(hostname) at $(date))"
+    if [ -d "$HOME_RUN_DIR" ]; then
+        rsync -avh "$HOME_RUN_DIR/" "$SCRATCH_RUN_DIR/"
+        echo "Run directory restored from home at $(date)"
+    fi
+fi
+
+# ----------------------------------------------------------------------------------
+# Track memmap pre-existence per dataset
+# ----------------------------------------------------------------------------------
+for dataset in ${DATASETS[@]}; do
+    VAR_NAME="${dataset^^}_MEMMAP_EXISTS"
+    if [ -d "$HOME_DATA_ROOT/$dataset/memmap" ]; then
+        export $VAR_NAME=true
+    else
+        export $VAR_NAME=false
+    fi
+    echo "$dataset memmap pre-exists: $(eval echo \$$VAR_NAME)"
+done
+
+# ----------------------------------------------------------------------------------
+# Stop signal handler
+# ----------------------------------------------------------------------------------
+sig_handler_USR1()
+{
+    echo "STOP SIGNAL DETECTED - $(date)"
+
+    if [ -d "$SCRATCH_RUN_DIR" ]; then
+        rsync -avh "$SCRATCH_RUN_DIR/" "$HOME_RUN_DIR/"
+        echo "Run directory copied at $(date)"
+    fi
+
+    for dataset in ${DATASETS[@]}; do
+        SCRATCH_ENV_DIR="$SCRATCH_DATA_ROOT/$dataset"
+        HOME_ENV_DIR="$HOME_DATA_ROOT/$dataset"
+        VAR_NAME="${dataset^^}_MEMMAP_EXISTS"
+        PRE_EXISTED=$(eval echo \$$VAR_NAME)
+        if [ -d "$SCRATCH_ENV_DIR/memmap" ] && [ "$PRE_EXISTED" == "false" ]; then
+            echo "Copying newly created $dataset/memmap back..."
+            mkdir -p "$HOME_ENV_DIR"
+            rsync -avh "$SCRATCH_ENV_DIR/memmap/" "$HOME_ENV_DIR/memmap/"
+        fi
+    done
+
+    sleep 5
+    echo "Requeuing job $SLURM_JOB_ID..."
+    scontrol requeue $SLURM_JOB_ID
+    exit 0
+}
+
+trap 'sig_handler_USR1' USR1
+
+# ----------------------------------------------------------------------------------
+# Print job info
+# ----------------------------------------------------------------------------------
+echo "Job started on $(hostname) at $(date)"
+echo "Job ID: $SLURM_JOB_ID"
+script_start=$(date +%s)
+
+# ----------------------------------------------------------------------------------
+# Copy data to scratch
+# ----------------------------------------------------------------------------------
+mkdir -p $SCRATCH_DATA_ROOT
+echo "Copying data to scratch... ($(date))"
+
+for dataset in ${DATASETS[@]}; do
+    TAR_FILE="$HOME_DATA_ROOT/${dataset}.tar"
+    SCRATCH_ENV_DIR="$SCRATCH_DATA_ROOT/$dataset"
+    HOME_ENV_DIR="$HOME_DATA_ROOT/$dataset"
+    VAR_NAME="${dataset^^}_MEMMAP_EXISTS"
+    MEMMAP_EXISTED=$(eval echo \$$VAR_NAME)
+
+    if [ -f "$TAR_FILE" ]; then
+        echo "Extracting $dataset from tar..."
+        time tar -xf "$TAR_FILE" -C "$SCRATCH_DATA_ROOT/"
+    else
+        if [ "$MEMMAP_EXISTED" = true ]; then
+            time rsync -avh "$HOME_ENV_DIR/" "$SCRATCH_ENV_DIR/"
+        else
+            time rsync -avh --filter=':- .rsync-filter' --exclude='memmap/' \
+                "$HOME_ENV_DIR/" "$SCRATCH_ENV_DIR/"
+        fi
+    fi
+done
+
+echo "Data copy complete at $(date)"
+
+# ----------------------------------------------------------------------------------
+# Setup Python environment
+# ----------------------------------------------------------------------------------
+module load python/3.10
+VENV=jepa_wms module load uv/0.6.12
+
+# ----------------------------------------------------------------------------------
+# Run training
+# ----------------------------------------------------------------------------------
+echo "Starting training at $(date)"
+srun --ntasks=1 --exclusive uv run python -m app.main "$@" &
+
+TRAIN_PID=$!
+wait $TRAIN_PID
+
+# ----------------------------------------------------------------------------------
+# Copy results back to home
+# ----------------------------------------------------------------------------------
+echo "Training completed at $(date)"
+
+if [ -d "$SCRATCH_RUN_DIR" ]; then
+    rsync -avh "$SCRATCH_RUN_DIR/" "$HOME_RUN_DIR/"
+    echo "Run directory copied at $(date)"
+fi
+
+for dataset in ${DATASETS[@]}; do
+    SCRATCH_ENV_DIR="$SCRATCH_DATA_ROOT/$dataset"
+    HOME_ENV_DIR="$HOME_DATA_ROOT/$dataset"
+    VAR_NAME="${dataset^^}_MEMMAP_EXISTS"
+    PRE_EXISTED=$(eval echo \$$VAR_NAME)
+    if [ -d "$SCRATCH_ENV_DIR/memmap" ] && [ "$PRE_EXISTED" == "false" ]; then
+        echo "Syncing newly created $dataset/memmap..."
+        mkdir -p "$HOME_ENV_DIR"
+        rsync -avh "$SCRATCH_ENV_DIR/memmap/" "$HOME_ENV_DIR/memmap/"
+    fi
+done
+
+# ----------------------------------------------------------------------------------
+# Cleanup and runtime
+# ----------------------------------------------------------------------------------
+cleanup_cache() {
+    if [ -d "$TORCHINDUCTOR_CACHE_DIR" ]; then
+        rm -rf "$TORCHINDUCTOR_CACHE_DIR"
+    fi
+}
+trap cleanup_cache EXIT
+
+end=$(date +%s)
+script_time=$((end - script_start))
+echo "========================================"
+echo "Job completed. Runtime: $((script_time/3600))h $(((script_time%3600)/60))m $((script_time%60))s"
+echo "Finished at: $(date)"
+echo "========================================"
